@@ -1,0 +1,13 @@
+[package]
+name = "fastcgi"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lut99"]
+license = "Apache-2.0"
+repository = "https://github.com/Lut99/fastcgi-rs"
+description = "A Rust implementation of the FastCGI process control protocol."
+
+
+[dependencies]
+
+
