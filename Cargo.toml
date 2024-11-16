@@ -9,5 +9,4 @@ description = "A Rust implementation of the FastCGI process control protocol."
 
 
 [dependencies]
-
-
+stackvec = { git = "https://github.com/Lut99/stackvec-rs" }
