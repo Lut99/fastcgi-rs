@@ -4,7 +4,7 @@
 //  Created:
 //    16 Nov 2024, 16:07:07
 //  Last edited:
-//    16 Nov 2024, 16:07:35
+//    14 Jan 2025, 22:15:09
 //  Auto updated?
 //    Yes
 //
@@ -13,4 +13,4 @@
 //
 
 // Declare the modules
-pub mod spec;
+pub mod raw;
