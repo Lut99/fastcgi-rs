@@ -192,15 +192,7 @@ impl FastCGI {
         // Await it's response
         #[cfg(feature = "log")]
         info!("Receiving GetValuesResult response from {:?}...", self.addr);
-        // let res = GetValuesResultRecord::from_fcgi_bytes(&mut self.conn).map_err(|err| Error::GetValuesResponse { addr: self.addr.clone(), err })?;
-        // #[cfg(feature = "log")]
-        // debug!("{res:?}");
-        let mut res = [0u8; 8192];
-        let mut res_i: usize = 0;
-        while res_i == 0 {
-            res_i += std::io::Read::read(&mut self.conn, &mut res).unwrap();
-        }
-        let res = GetValuesResultRecord::from_fcgi_bytes(&res[..res_i])
+        let res = GetValuesResultRecord::from_fcgi_bytes(&mut self.conn)
             .map_err(|err| Error::GetValuesResponse { addr: self.addr.clone(), err })?
             .ok_or_else(|| Error::NoGetValuesResponse { addr: self.addr.clone() })?;
 
