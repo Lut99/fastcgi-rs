@@ -81,6 +81,7 @@ fn main() -> ExitCode {
     match args.cmd {
         Command::Params { params } => {
             // Request the standard parameters
+            // Looks intimidating, mostly just creates iterators for parameters
             let values: HashMap<String, String> = match fastcgi.get_values(if let Some(params) = &params {
                 Box::new(params.iter().map(String::as_str)) as Box<dyn Iterator<Item = &str>>
             } else {
@@ -92,6 +93,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 },
             };
+            // Print them
             println!("Application parameters:");
             for (name, value) in values.into_iter() {
                 println!("  {name:?}: {value:?}");
