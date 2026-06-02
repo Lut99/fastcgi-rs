@@ -12,8 +12,6 @@ use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::{Arc, MutexGuard, RwLockReadGuard, RwLockWriteGuard};
 
-#[cfg(feature = "log")]
-use log::trace;
 use thiserror::Error;
 
 
@@ -70,8 +68,6 @@ pub const PARAM_MPXS_CONNS: &'static str = "FCGI_MPXS_CONNS";
 pub enum StringError {
     #[error("Failed to read from reader")]
     Read(#[from] std::io::Error),
-    #[error("Missing null-byte when parsing string")]
-    MissingNull,
     #[error("Got invalid UTF-8 when parsing string")]
     FromUtf8(#[from] std::string::FromUtf8Error),
 }
@@ -230,8 +226,6 @@ impl ToFastCGIBytes for str {
     fn to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> {
         // Write the bytes of the string
         output.write_all(self.as_bytes())?;
-        // Then write the null-byte
-        output.write_all(&[0x00])?;
         Ok(())
     }
 }
@@ -244,31 +238,9 @@ impl FromFastCGIBytes for String {
 
     #[inline]
     fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
-        const BUF_LEN: usize = 8192;
-
-        // Read up to the first null-byte
         let mut buf = Vec::new();
-        let mut buf_len: usize = 0;
-        loop {
-            // Load a chunk into the buffer
-            buf.extend(std::iter::repeat(0).take(BUF_LEN));
-            let read_len: usize = input.read(&mut buf[buf_len..BUF_LEN]).map_err(StringError::Read)?;
-            if read_len == 0 {
-                return Ok(None);
-            }
-
-            // Search it for the null-byte
-            for (i, b) in buf[buf_len..BUF_LEN].iter().copied().enumerate() {
-                if b == 0x00 {
-                    // Found the end; everything up to here is the string
-                    buf.truncate(buf_len + i);
-                    return String::from_utf8(buf).map(Some).map_err(StringError::FromUtf8);
-                }
-            }
-
-            // Continue searching
-            buf_len += BUF_LEN;
-        }
+        input.read_to_end(&mut buf).map_err(StringError::Read)?;
+        String::from_utf8(buf).map(Some).map_err(StringError::FromUtf8)
     }
 }
 
@@ -790,20 +762,20 @@ mod tests {
 
     #[test]
     fn test_string_to_fcgi_bytes() {
-        assert_eq!(vectorize(String::new()), b"\0");
-        assert_eq!(vectorize(String::from("Hello, world!")), b"Hello, world!\0");
+        assert_eq!(vectorize(String::new()), b"");
+        assert_eq!(vectorize(String::from("Hello, world!")), b"Hello, world!");
     }
     #[test]
     fn test_string_from_fcgi_bytes() {
-        assert_eq!(devectorize(b"\0"), Some(String::new()));
-        assert_eq!(devectorize(b"Hello, world!\0"), Some(String::from("Hello, world!")));
-        assert_eq!(devectorize(b"Hello\0, world!\0"), Some(String::from("Hello")));
+        assert_eq!(devectorize(b""), Some(String::new()));
+        assert_eq!(devectorize(b"Hello, world!"), Some(String::from("Hello, world!")));
+        assert_eq!(devectorize(b"Hello\0, world!"), Some(String::from("Hello\0, world!")));
     }
 
     #[test]
     fn test_pair_to_fcgi_bytes() {
-        assert_eq!(vectorize(Pair { name: String::new(), value: () }), b"\x01\0\0");
-        assert_eq!(vectorize(Pair { name: String::from("foo"), value: String::from("bar") }), b"\x04\x04foo\0bar\0");
+        assert_eq!(vectorize(Pair { name: String::new(), value: () }), b"\0\0");
+        assert_eq!(vectorize(Pair { name: String::from("foo"), value: String::from("bar") }), b"\x03\x03foobar");
         assert_eq!(
             vectorize(Pair {
                 name:  String::from(
@@ -816,7 +788,7 @@ mod tests {
                 ),
                 value: String::from("bar"),
             }),
-            b"\0\0\x02\xE8\x04Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not. It's not a story the Jedi would tell you. It's a Sith legend. Darth Plagueis was a Dark Lord of the Sith, so powerful and so wise he could use the Force to influence the midichlorians to create life... He had such a knowledge of the dark side that he could even keep the ones he cared about from dying. The dark side of the Force is a pathway to many abilities some consider to be unnatural. He became so powerful... the only thing he was afraid of was losing his power, which eventually, of course, he did. Unfortunately, he taught his apprentice everything he knew, then his apprentice killed him in his sleep. Ironic. He could save others from death, but not himself.\0bar\0"
+            b"\0\0\x02\xE7\x03Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not. It's not a story the Jedi would tell you. It's a Sith legend. Darth Plagueis was a Dark Lord of the Sith, so powerful and so wise he could use the Force to influence the midichlorians to create life... He had such a knowledge of the dark side that he could even keep the ones he cared about from dying. The dark side of the Force is a pathway to many abilities some consider to be unnatural. He became so powerful... the only thing he was afraid of was losing his power, which eventually, of course, he did. Unfortunately, he taught his apprentice everything he knew, then his apprentice killed him in his sleep. Ironic. He could save others from death, but not himself.bar"
         );
     }
 
@@ -834,18 +806,18 @@ mod tests {
                     value: (),
                 }],
             }),
-            b"\x01\x09\0\0\0\x33\x05\0\x0f\0FCGI_MAX_CONNS\0\x0e\0FCGI_MAX_REQS\0\x10\0FCGI_MPXS_CONNS\0\0\0\0\0\0"
+            b"\x01\x09\0\0\0\x30\0\0\x0e\0FCGI_MAX_CONNS\x0d\0FCGI_MAX_REQS\x0f\0FCGI_MPXS_CONNS"
         );
     }
     #[test]
     fn test_record_from_fcgi_bytes() {
         assert_eq!(
-            devectorize(b"\x01\x09\0\0\0\x33\x05\0\x0f\0FCGI_MAX_CONNS\0\x0e\0FCGI_MAX_REQS\0\x10\0FCGI_MPXS_CONNS\0\0\0\0\0\0"),
+            devectorize(b"\x01\x09\0\0\0\x30\x02\0\x0e\0FCGI_MAX_CONNS\x0d\0FCGI_MAX_REQS\x0f\0FCGI_MPXS_CONNS\0\0"),
             Some(Record {
                 version: Version::One,
                 ty: RecordTy::GetValues,
                 request_id: 0,
-                padding_length: Some(5),
+                padding_length: Some(2),
                 reserved: Some(0),
                 content: vec![Pair { name: "FCGI_MAX_CONNS".to_string(), value: () }, Pair { name: "FCGI_MAX_REQS".to_string(), value: () }, Pair {
                     name:  "FCGI_MPXS_CONNS".to_string(),

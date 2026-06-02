@@ -58,6 +58,8 @@ pub enum Error {
         #[source]
         err:  crate::spec::GetValuesResultRecordError,
     },
+    #[error("Not enough bytes for a GetValuesResponse record from {addr:?}")]
+    NoGetValuesResponse { addr: String },
 }
 
 
@@ -198,11 +200,12 @@ impl FastCGI {
         while res_i == 0 {
             res_i += std::io::Read::read(&mut self.conn, &mut res).unwrap();
         }
-        println!("{:?}", &res[..res_i]);
-        let res = GetValuesResultRecord::from_fcgi_bytes(&res[..res_i]).map_err(|err| Error::GetValuesResponse { addr: self.addr.clone(), err })?;
-        #[cfg(feature = "log")]
-        debug!("{res:?}");
-        todo!()
+        let res = GetValuesResultRecord::from_fcgi_bytes(&res[..res_i])
+            .map_err(|err| Error::GetValuesResponse { addr: self.addr.clone(), err })?
+            .ok_or_else(|| Error::NoGetValuesResponse { addr: self.addr.clone() })?;
+
+        // Return as a map
+        Ok(res.content.into_iter().map(|p| (p.name, p.value)).collect())
     }
 
 

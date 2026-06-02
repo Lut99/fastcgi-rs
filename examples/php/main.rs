@@ -6,10 +6,11 @@
 //!   instance.
 //
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use error_trace::toplevel;
 use fastcgi::FastCGI;
 use fastcgi::spec::{PARAM_MAX_CONNS, PARAM_MAX_REQS, PARAM_MPXS_CONNS};
@@ -29,6 +30,19 @@ struct Arguments {
     /// Can give as a `<hostname>:<port>`-pair.
     #[clap(short, long, default_value = "localhost:9000")]
     address: String,
+
+    /// A subcommand to execute
+    #[clap(subcommand)]
+    cmd: Command,
+}
+
+#[derive(Clone, Subcommand)]
+enum Command {
+    #[clap(name = "params", about = "Read the value of some parameters from the PHP application.")]
+    Params {
+        #[clap(short, long, help = "If given, reads these parameters from the application instead of the default three.")]
+        params: Option<Vec<String>>,
+    },
 }
 
 
@@ -64,11 +78,25 @@ fn main() -> ExitCode {
         }
     };
 
-    // Request the standard parameters
-    if let Err(err) = fastcgi.get_values([PARAM_MAX_CONNS, PARAM_MAX_REQS, PARAM_MPXS_CONNS]) {
-        error!("{}", toplevel!(("Failed to get values from FCGI connection"), err));
-        return ExitCode::FAILURE;
+    match args.cmd {
+        Command::Params { params } => {
+            // Request the standard parameters
+            let values: HashMap<String, String> = match fastcgi.get_values(if let Some(params) = &params {
+                Box::new(params.iter().map(String::as_str)) as Box<dyn Iterator<Item = &str>>
+            } else {
+                Box::new([PARAM_MAX_CONNS, PARAM_MAX_REQS, PARAM_MPXS_CONNS].into_iter())
+            }) {
+                Ok(res) => res,
+                Err(err) => {
+                    error!("{}", toplevel!(("Failed to get values from FCGI connection"), err));
+                    return ExitCode::FAILURE;
+                },
+            };
+            println!("Application parameters:");
+            for (name, value) in values.into_iter() {
+                println!("  {name:?}: {value:?}");
+            }
+            ExitCode::SUCCESS
+        },
     }
-
-    ExitCode::SUCCESS
 }
