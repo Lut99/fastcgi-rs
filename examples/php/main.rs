@@ -7,15 +7,16 @@
 //
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use error_trace::toplevel;
-use fastcgi::FastCGI;
+use fastcgi::fcgi::FastCGI;
 use fastcgi::spec::{PARAM_MAX_CONNS, PARAM_MAX_REQS, PARAM_MPXS_CONNS};
 use humanlog::HumanLogger;
-use log::{error, info};
+use log::{debug, error, info};
+use tokio::net::TcpStream;
 
 
 /***** ARGUMENTS *****/
@@ -23,7 +24,7 @@ use log::{error, info};
 #[derive(Parser)]
 struct Arguments {
     /// If given, shows all debug information.
-    #[clap(long)]
+    #[clap(long, global = true)]
     trace:   bool,
     /// The address of the FastCGI server.
     ///
@@ -50,7 +51,8 @@ enum Command {
 
 
 /***** ENTRYPOINT *****/
-fn main() -> ExitCode {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
     // Parse args & setup logger
     let args = Arguments::parse();
     if let Err(err) = HumanLogger::terminal(if args.trace { humanlog::DebugMode::Full } else { humanlog::DebugMode::Debug }).init() {
@@ -58,35 +60,44 @@ fn main() -> ExitCode {
     }
     info!("{} - {} v{}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
-    // See if it's a socket...
-    let mut fastcgi = if Path::new(&args.address).exists() {
-        match FastCGI::connect_unix(&args.address) {
-            Ok(res) => res,
-            Err(err) => {
-                error!("{}", toplevel!(("Failed to establish FCGI connection"), err));
+    // Resolve the address
+    let addr: SocketAddr = match args.address.to_socket_addrs() {
+        Ok(mut addr) => match addr.next() {
+            Some(addr) => addr,
+            None => {
+                error!("Address {:?} did not resolve to any IP-addresses", args.address);
                 return ExitCode::FAILURE;
             },
-        }
-    } else {
-        // Establish a connection
-        match FastCGI::connect_addr(&args.address) {
-            Ok(res) => res,
-            Err(err) => {
-                error!("{}", toplevel!(("Failed to establish FCGI connection"), err));
-                return ExitCode::FAILURE;
-            },
-        }
+        },
+        Err(err) => {
+            error!("{}", toplevel!(("Failed to resolve address {:?}", args.address), err));
+            return ExitCode::FAILURE;
+        },
     };
+    debug!("Resolved {:?} to {addr:?}", args.address);
+
+    // Establish a connection
+    let fastcgi = match TcpStream::connect(addr).await {
+        Ok(res) => FastCGI::new(res),
+        Err(err) => {
+            error!("{}", toplevel!(("Failed to establish TCP connection to {addr:?}"), err));
+            return ExitCode::FAILURE;
+        },
+    };
+    debug!("Connected to {addr:?}");
 
     match args.cmd {
         Command::Params { params } => {
             // Request the standard parameters
             // Looks intimidating, mostly just creates iterators for parameters
-            let values: HashMap<String, String> = match fastcgi.get_values(if let Some(params) = &params {
-                Box::new(params.iter().map(String::as_str)) as Box<dyn Iterator<Item = &str>>
-            } else {
-                Box::new([PARAM_MAX_CONNS, PARAM_MAX_REQS, PARAM_MPXS_CONNS].into_iter())
-            }) {
+            let values: HashMap<String, String> = match fastcgi
+                .get_values(if let Some(params) = &params {
+                    Box::new(params.iter().map(String::as_str)) as Box<dyn Iterator<Item = &str>>
+                } else {
+                    Box::new([PARAM_MAX_CONNS, PARAM_MAX_REQS, PARAM_MPXS_CONNS].into_iter())
+                })
+                .await
+            {
                 Ok(res) => res,
                 Err(err) => {
                     error!("{}", toplevel!(("Failed to get values from FCGI connection"), err));
