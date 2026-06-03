@@ -16,7 +16,7 @@ use log::{debug, info};
 use thiserror::Error;
 
 use super::FastCGI;
-use crate::spec::{FromFastCGIBytes, GetValuesRecord, GetValuesResultRecord, ToFastCGIBytes as _};
+use crate::spec::{FromFastCGIBytes as _, Record, RecordBody, ToFastCGIBytes as _};
 
 
 /***** ERRORS *****/
@@ -56,10 +56,14 @@ pub enum Error {
     GetValuesResponse {
         addr: String,
         #[source]
-        err:  crate::spec::GetValuesResultRecordError,
+        err:  crate::spec::RecordError,
     },
     #[error("Not enough bytes for a GetValuesResponse record from {addr:?}")]
     NoGetValuesResponse { addr: String },
+    #[error("Server {addr:?} returned that type 0x{ty:02X} is unknown")]
+    UnknownType { addr: String, ty: u8 },
+    #[error("Server {addr:?} returned unexpected record type")]
+    UnexpectedRecord { addr: String },
 }
 
 
@@ -182,7 +186,7 @@ impl FastCGI {
             .collect::<Result<Vec<&'p str>, Error>>()?;
 
         // Build a record and send it over the wire to the application
-        let rec = GetValuesRecord::new_get_values_record(params);
+        let rec = Record::new_get_values_record(params);
         #[cfg(feature = "log")]
         info!("Sending GetValues request to {:?}...", self.addr);
         if let Err(err) = rec.to_fcgi_bytes(&mut self.conn) {
@@ -192,12 +196,16 @@ impl FastCGI {
         // Await it's response
         #[cfg(feature = "log")]
         info!("Receiving GetValuesResult response from {:?}...", self.addr);
-        let res = GetValuesResultRecord::from_fcgi_bytes(&mut self.conn)
+        let res = Record::from_fcgi_bytes(&mut self.conn)
             .map_err(|err| Error::GetValuesResponse { addr: self.addr.clone(), err })?
             .ok_or_else(|| Error::NoGetValuesResponse { addr: self.addr.clone() })?;
 
-        // Return as a map
-        Ok(res.content.into_iter().map(|p| (p.name, p.value)).collect())
+        // Return the result if it's of the appropriate record type; else, we error
+        match res.content {
+            RecordBody::GetValuesResult(res) => Ok(res.params.into_iter().map(|p| (p.name.into_owned(), p.value.into_owned())).collect()),
+            RecordBody::UnknownType(ty) => Err(Error::UnknownType { addr: self.addr.clone(), ty: ty.ty }),
+            _ => Err(Error::UnexpectedRecord { addr: self.addr.clone() }),
+        }
     }
 
 

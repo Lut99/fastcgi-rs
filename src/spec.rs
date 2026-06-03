@@ -5,10 +5,12 @@
 //!   Defines the messages on the wire.
 //
 
+use std::borrow::Cow;
 use std::cell::{Ref, RefMut};
 use std::convert::Infallible;
 use std::error::Error;
 use std::io::{Read, Write};
+use std::mem::MaybeUninit;
 use std::rc::Rc;
 use std::sync::{Arc, MutexGuard, RwLockReadGuard, RwLockWriteGuard};
 
@@ -17,6 +19,23 @@ use thiserror::Error;
 
 /***** HELPER MACROS *****/
 macro_rules! fast_cgi_bytes_ptr_impl {
+    ('a, Cow<'a, T>) => {
+        impl<'a, T: ?Sized + ToOwned + ToFastCGIBytes> ToFastCGIBytes for Cow<'a, T> {
+            #[inline]
+            fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { <T as ToFastCGIBytes>::to_fcgi_bytes(self, output) }
+        }
+        impl<T: ?Sized + ToOwned> FromFastCGIBytes for Cow<'static, T>
+        where
+            T::Owned: FromFastCGIBytes,
+        {
+            type Error = <T::Owned as FromFastCGIBytes>::Error;
+
+            #[inline]
+            fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> {
+                <T::Owned as FromFastCGIBytes>::from_fcgi_bytes(input).map(|r| r.map(Cow::Owned))
+            }
+        }
+    };
     ('a, $ty:ty) => {
         impl<'a, T: ?Sized + ToFastCGIBytes> ToFastCGIBytes for $ty {
             #[inline]
@@ -63,6 +82,25 @@ pub const PARAM_MPXS_CONNS: &'static str = "FCGI_MPXS_CONNS";
 
 
 /***** ERRORS *****/
+/// Error for failing to parse a [`u16`].
+#[derive(Debug, Error)]
+#[allow(non_camel_case_types)]
+pub enum u16Error {
+    #[error("Failed to read from reader")]
+    Read(#[from] std::io::Error),
+    #[error("Not enough bytes were present (got {0}, expected 2)")]
+    NotEnough(usize),
+}
+
+/// Error for failing to parse an array.
+#[derive(Debug, Error)]
+pub enum ArrayError<E> {
+    #[error("Failed to read element of type {what:?}")]
+    Elem { what: &'static str, err: E },
+    #[error("Not enough elements (expected {expected}, got {got})")]
+    NotEnough { expected: usize, got: usize },
+}
+
 /// Error for failing to parse a string.
 #[derive(Debug, Error)]
 pub enum StringError {
@@ -92,15 +130,81 @@ pub enum PairError<N, V> {
     Value(#[source] V),
 }
 
+/// Error for failing to parse a [`RecordBody`]
+#[derive(Debug, Error)]
+pub enum RecordBodyError {
+    #[error("Failed to read an FCGI_BEGIN_REQUEST record")]
+    BeginRequest(#[source] std::io::Error),
+    #[error("Failed to read an FCGI_ABORT_REQUEST record")]
+    AbortRequest(#[source] std::io::Error),
+    #[error("Failed to read an FCGI_END_REQUEST record")]
+    EndRequest(#[source] std::io::Error),
+    #[error("Failed to read an FCGI_PARAMS record")]
+    Params(#[source] std::io::Error),
+    #[error("Failed to read an FCGI_STDIN record")]
+    Stdin(#[source] std::io::Error),
+    #[error("Failed to read an FCGI_STDOUT record")]
+    Stdout(#[source] std::io::Error),
+    #[error("Failed to read an FCGI_STDERR record")]
+    Stderr(#[source] std::io::Error),
+    #[error("Failed to read an FCGI_DATA record")]
+    Data(#[source] std::io::Error),
+    #[error("Failed to read an FCGI_GET_VALUES record")]
+    GetValues(#[source] PairError<StringError, Infallible>),
+    #[error("Failed to read an FCGI_GET_VALUES_RESULT record")]
+    GetValuesResult(#[source] PairError<StringError, StringError>),
+    #[error("Failed to read an FCGI_UNKNOWN_TYPE record")]
+    UnknownType(#[source] RecordUnknownTypeError),
+}
+
+/// Error for failing to parse a [`RecordUnknownType`].
+#[derive(Debug, Error)]
+pub enum RecordUnknownTypeError {
+    #[error("Failed to read the type-byte")]
+    Ty(#[from] std::io::Error),
+    #[error("Failed to read the reserved-bytes")]
+    Reserved(#[from] ArrayError<std::io::Error>),
+}
+
 /// Error for failing to parse a [`Record`].
 #[derive(Debug, Error)]
-pub enum RecordError<E> {
+pub enum RecordError {
     #[error("Failed to read from reader")]
     Read(#[from] std::io::Error),
     #[error("{0}")]
+    #[allow(non_camel_case_types)]
+    u16(#[from] u16Error),
+    #[error("{0}")]
     Version(#[from] VersionError),
-    #[error("Failed to read content")]
-    Content(#[source] E),
+    #[error("Failed to read body of record")]
+    Body(#[from] RecordBodyError),
+}
+
+
+
+
+
+/***** HELPERS *****/
+/// A [`Read`]er that fixes the amount of bytes read.
+#[derive(Debug)]
+struct FixedLenReader<R> {
+    reader: R,
+    i:      usize,
+    max:    usize,
+}
+impl<R> FixedLenReader<R> {
+    #[inline]
+    fn new(max: usize, reader: R) -> Self { Self { reader, i: 0, max } }
+}
+impl<R: Read> Read for FixedLenReader<R> {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Check how many bytes we've read
+        let togo: usize = self.max - self.i;
+        let n: usize = if buf.len() >= togo { self.reader.read(&mut buf[..togo as usize])? } else { self.reader.read(buf)? };
+        self.i += n;
+        Ok(n)
+    }
 }
 
 
@@ -177,14 +281,24 @@ impl ToFastCGIBytes for u16 {
     fn to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> { output.write_all(&self.to_be_bytes()) }
 }
 impl FromFastCGIBytes for u16 {
-    type Error = std::io::Error;
+    type Error = u16Error;
 
     #[inline]
     fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
         // Read two bytes
+        let mut bytes_i: usize = 0;
         let mut bytes: [u8; 2] = [0, 0];
-        let n: usize = input.read(&mut bytes)?;
-        if n >= 2 { Ok(Some(u16::from_be_bytes(bytes))) } else { Ok(None) }
+        while bytes_i < 2 {
+            let n: usize = input.read(&mut bytes[bytes_i..])?;
+            if n == 0 {
+                if bytes_i == 0 {
+                    return Ok(None);
+                }
+                return Err(u16Error::NotEnough(bytes_i));
+            }
+            bytes_i += n;
+        }
+        Ok(Some(u16::from_be_bytes(bytes)))
     }
 }
 impl<T: ToFastCGIBytes> ToFastCGIBytes for [T] {
@@ -194,6 +308,28 @@ impl<T: ToFastCGIBytes> ToFastCGIBytes for [T] {
             elem.to_fcgi_bytes(&mut output)?;
         }
         Ok(())
+    }
+}
+impl<const LEN: usize, T: ToFastCGIBytes> ToFastCGIBytes for [T; LEN] {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { <[T]>::to_fcgi_bytes(self, output) }
+}
+impl<const LEN: usize, T: FromFastCGIBytes> FromFastCGIBytes for [T; LEN] {
+    type Error = ArrayError<T::Error>;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
+        let mut res: [MaybeUninit<T>; LEN] = [const { MaybeUninit::uninit() }; LEN];
+        for i in 0..LEN {
+            match T::from_fcgi_bytes(&mut input) {
+                Ok(Some(elem)) => res[i].write(elem),
+                Ok(None) => return Err(ArrayError::NotEnough { got: i, expected: LEN }),
+                Err(err) => return Err(ArrayError::Elem { what: std::any::type_name::<T>(), err }),
+            };
+        }
+        // SAFETY: This is OK because we initialize *all* elements. Hence, we can assume the array
+        // as a whole as initialized.
+        Ok(Some(unsafe { MaybeUninit::<[T; LEN]>::from(res).assume_init() }))
     }
 }
 impl<T: ToFastCGIBytes> ToFastCGIBytes for Vec<T> {
@@ -247,6 +383,7 @@ impl FromFastCGIBytes for String {
 // Pointer-like impls
 fast_cgi_bytes_ptr_impl!('a, &'a T);
 fast_cgi_bytes_ptr_impl!('a, &'a mut T);
+fast_cgi_bytes_ptr_impl!('a, Cow<'a, T>);
 fast_cgi_bytes_ptr_impl!(Box<T>);
 fast_cgi_bytes_ptr_impl!(Rc<T>);
 fast_cgi_bytes_ptr_impl!(Arc<T>);
@@ -261,6 +398,70 @@ fast_cgi_bytes_ptr_impl!('a, RwLockWriteGuard<'a, T>);
 
 
 /***** AUXILLARY *****/
+/// Defines a 32-bit number that's either written compact or lengthy.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(non_camel_case_types)]
+pub struct u32Compact(pub u32);
+impl ToFastCGIBytes for u32Compact {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> {
+        if self.0 <= 127 {
+            // Simple-length case; it's a 8-bit, <= 127 number (MSB is 0)
+
+            //     unsigned char numB0;  /* numB0  >> 7 == 0 */
+            output.write_all(&self.0.to_be_bytes()[3..])
+        } else {
+            // Expanded-length case; it's a 32-bit length number (MSB is 1)
+
+            //     unsigned char numB3;  /* numB3  >> 7 == 1 */
+            //     unsigned char numB2;
+            //     unsigned char numB1;
+            //     unsigned char numB0;
+            let mut res: [u8; 4] = self.0.to_be_bytes();
+            res[0] |= 0x80; // Don't forget to mark this is a big byte
+            output.write_all(&res)
+        }
+    }
+}
+impl FromFastCGIBytes for u32Compact {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
+        // Parse the number as a 32-bit number - but start at the first byte
+        let mut num: [u8; 4] = [0; 4];
+        num[0] = escape_none!(u8::from_fcgi_bytes(&mut input)?);
+        if num[0] <= 127 {
+            // Simple-length case; it's a 8-bit, <= 127 number (MSB is 0)
+            Ok(Some(Self(num[0] as u32)))
+        } else {
+            // Expanded-length case; it's a 32-bit length number (MSB is 1)
+            let mut num_i: usize = 1;
+            while num_i < 4 {
+                let len: usize = input.read(&mut num[num_i..])?;
+                if len == 0 {
+                    return Ok(None);
+                }
+                num_i += len;
+            }
+            // NOTE: Before we return, don't forget to mask the telling MSB, as it's still the
+            // MSB (i.e., it's no longer representing 2^7, but rather, 2^31)
+            num[0] = num[0] & 0x7F;
+            Ok(Some(Self(u32::from_be_bytes(num))))
+        }
+    }
+}
+impl From<u32> for u32Compact {
+    #[inline]
+    fn from(value: u32) -> Self { Self(value) }
+}
+impl From<u32Compact> for u32 {
+    #[inline]
+    fn from(value: u32Compact) -> Self { value.0 }
+}
+
+
+
 /// Defines the possible version numbers.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Version {
@@ -286,95 +487,6 @@ impl FromFastCGIBytes for Version {
         match u8::from_fcgi_bytes(input).map_err(VersionError::Read)? {
             Some(0x01) => Ok(Some(Self::One)),
             Some(byte) => Err(VersionError::Unknown(byte)),
-            None => Ok(None),
-        }
-    }
-}
-
-/// Defines the possible record types.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum RecordTy {
-    /// Start of a request.
-    ///
-    /// Value: `0x01` (`FCGI_BEGIN_REQUEST`)
-    BeginRequest,
-    /// Dirty exit of a request.
-    ///
-    /// Value: `0x02` (`FCGI_ABORT_REQUEST`)
-    AbortRequest,
-    /// Clean exit of a request.
-    ///
-    /// Value: `0x03` (`FCGI_END_REQUEST`)
-    EndRequest,
-    /// Send parameters to the binary.
-    ///
-    /// Value: `0x04` (`FCGI_PARAMS`)
-    Params,
-    /// Message to stream stdin bytes to the application.
-    ///
-    /// Value: `0x05` (`FCGI_STDIN`)
-    Stdin,
-    /// Message to stream stdout bytes back to the server.
-    ///
-    /// Value: `0x06` (`FCGI_STDOUT`)
-    Stdout,
-    /// Message to stream stderr bytes back to the server.
-    ///
-    /// Value: `0x07` (`FCGI_STDERR`)
-    Stderr,
-    /// TODO
-    ///
-    /// Value: `0x08` (`FCGI_DATA`)
-    Data,
-    /// TODO
-    ///
-    /// Value: `0x09` (`FCGI_GET_VALUES`)
-    GetValues,
-    /// TODO
-    ///
-    /// Value: `0x0A` (`FCGI_GET_VALUES_RESULT`)
-    GetValuesResult,
-    /// Leftover type we serialize to if we don't know.
-    ///
-    /// Value: `0x0B` (`FCGI_UNKNOWN_TYPE`)
-    UnknownType,
-}
-impl ToFastCGIBytes for RecordTy {
-    #[inline]
-    fn to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> {
-        output.write_all(std::slice::from_ref(match self {
-            Self::BeginRequest => &0x01,
-            Self::AbortRequest => &0x02,
-            Self::EndRequest => &0x03,
-            Self::Params => &0x04,
-            Self::Stdin => &0x05,
-            Self::Stdout => &0x06,
-            Self::Stderr => &0x07,
-            Self::Data => &0x08,
-            Self::GetValues => &0x09,
-            Self::GetValuesResult => &0x0A,
-            Self::UnknownType => &0x0B,
-        }))
-    }
-}
-impl FromFastCGIBytes for RecordTy {
-    type Error = std::io::Error;
-
-    #[inline]
-    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> {
-        // Read a byte
-        match u8::from_fcgi_bytes(input)? {
-            Some(0x01) => Ok(Some(Self::BeginRequest)),
-            Some(0x02) => Ok(Some(Self::AbortRequest)),
-            Some(0x03) => Ok(Some(Self::EndRequest)),
-            Some(0x04) => Ok(Some(Self::Params)),
-            Some(0x05) => Ok(Some(Self::Stdin)),
-            Some(0x06) => Ok(Some(Self::Stdout)),
-            Some(0x07) => Ok(Some(Self::Stderr)),
-            Some(0x08) => Ok(Some(Self::Data)),
-            Some(0x09) => Ok(Some(Self::GetValues)),
-            Some(0x0A) => Ok(Some(Self::GetValuesResult)),
-            Some(0x0B | _) => Ok(Some(Self::UnknownType)),
             None => Ok(None),
         }
     }
@@ -429,24 +541,12 @@ impl<N: ToFastCGIBytes, V: ToFastCGIBytes> ToFastCGIBytes for Pair<N, V> {
         //     unsigned char nameLengthB2;
         //     unsigned char nameLengthB1;
         //     unsigned char nameLengthB0;
-        if name_len <= 127 {
-            // Simple-length case; it's a 8-bit, <= 127 number (MSB is 0)
-            output.write_all(&name_len.to_be_bytes()[3..])?;
-        } else {
-            // Expanded-length case; it's a 32-bit length number (MSB is 1)
-            output.write_all(&name_len.to_be_bytes())?;
-        }
+        u32Compact(name_len).to_fcgi_bytes(&mut output)?;
         //     unsigned char valueLengthB3; /* valueLengthB3 >> 7 == 1 */
         //     unsigned char valueLengthB2;
         //     unsigned char valueLengthB1;
         //     unsigned char valueLengthB0;
-        if value_len <= 127 {
-            // Simple-length case; it's a 8-bit, <= 127 number (MSB is 0)
-            output.write_all(&value_len.to_be_bytes()[3..])?;
-        } else {
-            // Expanded-length case; it's a 32-bit length number (MSB is 1)
-            output.write_all(&value_len.to_be_bytes())?;
-        }
+        u32Compact(value_len).to_fcgi_bytes(&mut output)?;
         //     unsigned char nameData[nameLength
         //             ((B3 & 0x7f) << 24) + (B2 << 16) + (B1 << 8) + B0];
         output.write_all(&name)?;
@@ -462,30 +562,6 @@ impl<N: FromFastCGIBytes, V: FromFastCGIBytes> FromFastCGIBytes for Pair<N, V> {
 
     #[inline]
     fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
-        fn read_8_or_31_bit_number<R: Read>(mut input: R) -> Result<Option<u32>, std::io::Error> {
-            // Parse the length of the name buffer
-            let mut length_bytes: [u8; 4] = [0; 4];
-            length_bytes[0] = escape_none!(u8::from_fcgi_bytes(&mut input)?);
-            if length_bytes[0] <= 127 {
-                // Simple-length case; it's a 8-bit, <= 127 number (MSB is 0)
-                Ok(Some(length_bytes[0] as u32))
-            } else {
-                // Expanded-length case; it's a 32-bit length number (MSB is 1)
-                let mut length_bytes_i: usize = 1;
-                while length_bytes_i < 4 {
-                    let len: usize = input.read(&mut length_bytes[length_bytes_i..])?;
-                    if len == 0 {
-                        return Ok(None);
-                    }
-                    length_bytes_i += len;
-                }
-                // NOTE: Before we return, don't forget to mask the telling MSB, as it's still the
-                // MSB (i.e., it's no longer representing 2^7, but rather, 2^31)
-                length_bytes[0] = length_bytes[0] & 0x7F;
-                Ok(Some(u32::from_be_bytes(length_bytes)))
-            }
-        }
-
         #[cfg(feature = "log")]
         log::trace!("Attempting {}", std::any::type_name::<Self>());
         // NOTE: The length of the nameLength/valueLength numbers varies!
@@ -508,42 +584,337 @@ impl<N: FromFastCGIBytes, V: FromFastCGIBytes> FromFastCGIBytes for Pair<N, V> {
         //     unsigned char nameLengthB2;
         //     unsigned char nameLengthB1;
         //     unsigned char nameLengthB0;
-        let name_len: u32 = escape_none!(read_8_or_31_bit_number(&mut input).map_err(PairError::Read)?);
+        let name_len: u32 = escape_none!(u32Compact::from_fcgi_bytes(&mut input).map_err(PairError::Read)?).0;
         #[cfg(feature = "log")]
         log::trace!("Parsed name length: {name_len} bytes");
         //     unsigned char valueLengthB3; /* valueLengthB3 >> 7 == 1 */
         //     unsigned char valueLengthB2;
         //     unsigned char valueLengthB1;
         //     unsigned char valueLengthB0;
-        let value_len: u32 = escape_none!(read_8_or_31_bit_number(&mut input).map_err(PairError::Read)?);
+        let value_len: u32 = escape_none!(u32Compact::from_fcgi_bytes(&mut input).map_err(PairError::Read)?).0;
         #[cfg(feature = "log")]
         log::trace!("Parsed value length: {name_len} bytes");
         //     unsigned char nameData[nameLength
         //             ((B3 & 0x7f) << 24) + (B2 << 16) + (B1 << 8) + B0];
-        let mut name_i: usize = 0;
-        let mut name: Vec<u8> = vec![0; name_len as usize];
-        while name_i < name_len as usize {
-            let len: usize = input.read(&mut name[name_i..]).map_err(PairError::Read)?;
-            if len == 0 {
-                return Ok(None);
-            }
-            name_i += len;
-        }
-        let name = escape_none!(N::from_fcgi_bytes(name.as_slice()).map_err(PairError::Name)?);
+        let name = escape_none!(N::from_fcgi_bytes(FixedLenReader::new(name_len as usize, &mut input)).map_err(PairError::Name)?);
         //     unsigned char valueData[valueLength
         //             ((B3 & 0x7f) << 24) + (B2 << 16) + (B1 << 8) + B0];
-        let mut value_i: usize = 0;
-        let mut value: Vec<u8> = vec![0; value_len as usize];
-        while value_i < value_len as usize {
-            let len: usize = input.read(&mut value[value_i..]).map_err(PairError::Read)?;
-            if len == 0 {
-                return Ok(None);
-            }
-            value_i += len;
-        }
-        let value = escape_none!(V::from_fcgi_bytes(value.as_slice()).map_err(PairError::Value)?);
+        let value = escape_none!(V::from_fcgi_bytes(FixedLenReader::new(value_len as usize, &mut input)).map_err(PairError::Value)?);
 
         Ok(Some(Self { name, value }))
+    }
+}
+
+
+
+/// Defines the possible contents of the FastCFG records.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum RecordBody<'a> {
+    /// Start of a request.
+    ///
+    /// Value: `0x01` (`FCGI_BEGIN_REQUEST`)
+    BeginRequest(RecordBeginRequest),
+    /// Dirty exit of a request.
+    ///
+    /// Value: `0x02` (`FCGI_ABORT_REQUEST`)
+    AbortRequest(RecordAbortRequest),
+    /// Clean exit of a request.
+    ///
+    /// Value: `0x03` (`FCGI_END_REQUEST`)
+    EndRequest(RecordEndRequest),
+    /// Send parameters to the binary.
+    ///
+    /// Value: `0x04` (`FCGI_PARAMS`)
+    Params(RecordParams),
+    /// Message to stream stdin bytes to the application.
+    ///
+    /// Value: `0x05` (`FCGI_STDIN`)
+    Stdin(RecordStdin),
+    /// Message to stream stdout bytes back to the server.
+    ///
+    /// Value: `0x06` (`FCGI_STDOUT`)
+    Stdout(RecordStdout),
+    /// Message to stream stderr bytes back to the server.
+    ///
+    /// Value: `0x07` (`FCGI_STDERR`)
+    Stderr(RecordStderr),
+    /// TODO
+    ///
+    /// Value: `0x08` (`FCGI_DATA`)
+    Data(RecordData),
+    /// TODO
+    ///
+    /// Value: `0x09` (`FCGI_GET_VALUES`)
+    GetValues(RecordGetValues<'a>),
+    /// TODO
+    ///
+    /// Value: `0x0A` (`FCGI_GET_VALUES_RESULT`)
+    GetValuesResult(RecordGetValuesResult<'a>),
+    /// Leftover type we serialize to if we don't know.
+    ///
+    /// Value: `0x0B` (`FCGI_UNKNOWN_TYPE`)
+    UnknownType(RecordUnknownType),
+}
+impl<'a> ToFastCGIBytes for RecordBody<'a> {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> {
+        match self {
+            Self::BeginRequest(r) => r.to_fcgi_bytes(output),
+            Self::AbortRequest(r) => r.to_fcgi_bytes(output),
+            Self::EndRequest(r) => r.to_fcgi_bytes(output),
+            Self::Params(r) => r.to_fcgi_bytes(output),
+            Self::Stdin(r) => r.to_fcgi_bytes(output),
+            Self::Stdout(r) => r.to_fcgi_bytes(output),
+            Self::Stderr(r) => r.to_fcgi_bytes(output),
+            Self::Data(r) => r.to_fcgi_bytes(output),
+            Self::GetValues(r) => r.to_fcgi_bytes(output),
+            Self::GetValuesResult(r) => r.to_fcgi_bytes(output),
+            Self::UnknownType(r) => r.to_fcgi_bytes(output),
+        }
+    }
+}
+impl<'a> RecordBody<'a> {
+    /// Like [`ToFCGIBytes::to_fcgi_bytes()`], but then for the type-byte only.
+    #[inline]
+    fn ty_to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> {
+        output.write_all(std::slice::from_ref(match self {
+            Self::BeginRequest(_) => &0x01,
+            Self::AbortRequest(_) => &0x02,
+            Self::EndRequest(_) => &0x03,
+            Self::Params(_) => &0x04,
+            Self::Stdin(_) => &0x05,
+            Self::Stdout(_) => &0x06,
+            Self::Stderr(_) => &0x07,
+            Self::Data(_) => &0x08,
+            Self::GetValues(_) => &0x09,
+            Self::GetValuesResult(_) => &0x0A,
+            Self::UnknownType(_) => &0x0B,
+        }))
+    }
+}
+impl RecordBody<'static> {
+    /// Like [`FromFCGIBytes::from_fcgi_bytes()`], but with type knowledge.
+    #[inline]
+    fn from_fcgi_bytes_and_ty<R: Read>(ty: u8, input: R) -> Result<Option<Self>, RecordBodyError> {
+        // Read a byte
+        match ty {
+            0x01 => Ok(RecordBeginRequest::from_fcgi_bytes(input).map_err(RecordBodyError::BeginRequest)?.map(RecordBody::BeginRequest)),
+            0x02 => Ok(RecordAbortRequest::from_fcgi_bytes(input).map_err(RecordBodyError::AbortRequest)?.map(RecordBody::AbortRequest)),
+            0x03 => Ok(RecordEndRequest::from_fcgi_bytes(input).map_err(RecordBodyError::EndRequest)?.map(RecordBody::EndRequest)),
+            0x04 => Ok(RecordParams::from_fcgi_bytes(input).map_err(RecordBodyError::Params)?.map(RecordBody::Params)),
+            0x05 => Ok(RecordStdin::from_fcgi_bytes(input).map_err(RecordBodyError::Stdin)?.map(RecordBody::Stdin)),
+            0x06 => Ok(RecordStdout::from_fcgi_bytes(input).map_err(RecordBodyError::Stdout)?.map(RecordBody::Stdout)),
+            0x07 => Ok(RecordStderr::from_fcgi_bytes(input).map_err(RecordBodyError::Stderr)?.map(RecordBody::Stderr)),
+            0x08 => Ok(RecordData::from_fcgi_bytes(input).map_err(RecordBodyError::Data)?.map(RecordBody::Data)),
+            0x09 => Ok(RecordGetValues::from_fcgi_bytes(input).map_err(RecordBodyError::GetValues)?.map(RecordBody::GetValues)),
+            0x0A => Ok(RecordGetValuesResult::from_fcgi_bytes(input).map_err(RecordBodyError::GetValuesResult)?.map(RecordBody::GetValuesResult)),
+            /* 0x0B */
+            ty => Ok(RecordUnknownType::from_fcgi_bytes(input).map_err(RecordBodyError::UnknownType)?.map(RecordBody::UnknownType)),
+        }
+    }
+}
+
+/// Defines the body of [`RecordBody::BeginRequest`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordBeginRequest {}
+impl ToFastCGIBytes for RecordBeginRequest {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { todo!() }
+}
+impl FromFastCGIBytes for RecordBeginRequest {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> { todo!() }
+}
+
+/// Defines the body of [`RecordBody::AbortRequest`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordAbortRequest {}
+impl ToFastCGIBytes for RecordAbortRequest {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { todo!() }
+}
+impl FromFastCGIBytes for RecordAbortRequest {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> { todo!() }
+}
+
+/// Defines the body of [`RecordBody::EndRequest`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordEndRequest {}
+impl ToFastCGIBytes for RecordEndRequest {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { todo!() }
+}
+impl FromFastCGIBytes for RecordEndRequest {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> { todo!() }
+}
+
+/// Defines the body of [`RecordBody::Params`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordParams {}
+impl ToFastCGIBytes for RecordParams {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { todo!() }
+}
+impl FromFastCGIBytes for RecordParams {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> { todo!() }
+}
+
+/// Defines the body of [`RecordBody::Stdin`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordStdin {}
+impl ToFastCGIBytes for RecordStdin {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { todo!() }
+}
+impl FromFastCGIBytes for RecordStdin {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> { todo!() }
+}
+
+/// Defines the body of [`RecordBody::Stdout`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordStdout {}
+impl ToFastCGIBytes for RecordStdout {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { todo!() }
+}
+impl FromFastCGIBytes for RecordStdout {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> { todo!() }
+}
+
+/// Defines the body of [`RecordBody::Stderr`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordStderr {}
+impl ToFastCGIBytes for RecordStderr {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { todo!() }
+}
+impl FromFastCGIBytes for RecordStderr {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> { todo!() }
+}
+
+/// Defines the body of [`RecordBody::Data`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordData {}
+impl ToFastCGIBytes for RecordData {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, output: W) -> Result<(), std::io::Error> { todo!() }
+}
+impl FromFastCGIBytes for RecordData {
+    type Error = std::io::Error;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(input: R) -> Result<Option<Self>, Self::Error> { todo!() }
+}
+
+/// Defines the body of [`RecordBody::GetValues`].
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RecordGetValues<'a> {
+    /// A list of parameters to send.
+    pub params: Vec<Cow<'a, str>>,
+}
+impl<'a> ToFastCGIBytes for RecordGetValues<'a> {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> {
+        for p in &self.params {
+            // Serialize as a pair
+            let pair: Pair<&Cow<'a, str>, ()> = Pair { name: p, value: () };
+            pair.to_fcgi_bytes(&mut output)?;
+        }
+        Ok(())
+    }
+}
+impl FromFastCGIBytes for RecordGetValues<'static> {
+    type Error = PairError<StringError, Infallible>;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
+        // Keep parsing pairs until we reach end-of-file
+        let mut params = Vec::<Cow<'static, str>>::new();
+        loop {
+            match Pair::<Cow<'static, str>, ()>::from_fcgi_bytes(&mut input) {
+                Ok(Some(p)) => params.push(p.name),
+                Ok(None) => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(Some(Self { params }))
+    }
+}
+
+/// Defines the body of [`RecordBody::GetValuesResult`].
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RecordGetValuesResult<'a> {
+    /// A list of parameters retrieved.
+    pub params: Vec<Pair<Cow<'a, str>, Cow<'a, str>>>,
+}
+impl<'a> ToFastCGIBytes for RecordGetValuesResult<'a> {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> {
+        for p in &self.params {
+            p.to_fcgi_bytes(&mut output)?;
+        }
+        Ok(())
+    }
+}
+impl FromFastCGIBytes for RecordGetValuesResult<'static> {
+    type Error = PairError<StringError, StringError>;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
+        // Keep parsing pairs until we reach end-of-file
+        let mut params = Vec::<Pair<Cow<'static, str>, Cow<'static, str>>>::new();
+        loop {
+            match Pair::<Cow<'static, str>, Cow<'static, str>>::from_fcgi_bytes(&mut input) {
+                Ok(Some(p)) => params.push(p),
+                Ok(None) => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(Some(Self { params }))
+    }
+}
+
+/// Defines the body of [`RecordBody::UnknownType`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RecordUnknownType {
+    pub ty: u8,
+    pub reserved: Option<[u8; 7]>,
+}
+impl ToFastCGIBytes for RecordUnknownType {
+    #[inline]
+    fn to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> {
+        self.ty.to_fcgi_bytes(&mut output)?;
+        if let Some(res) = &self.reserved { res.to_fcgi_bytes(output) } else { [0u8; 7].to_fcgi_bytes(output) }
+    }
+}
+impl FromFastCGIBytes for RecordUnknownType {
+    type Error = RecordUnknownTypeError;
+
+    #[inline]
+    fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
+        let ty: u8 = escape_none!(u8::from_fcgi_bytes(&mut input)?);
+        let reserved: [u8; 7] = escape_none!(<[u8; 7]>::from_fcgi_bytes(&mut input)?);
+        Ok(Some(Self { ty, reserved: Some(reserved) }))
     }
 }
 
@@ -554,12 +925,10 @@ impl<N: FromFastCGIBytes, V: FromFastCGIBytes> FromFastCGIBytes for Pair<N, V> {
 /// # Generics
 /// - `C`: The type of the content. You can replace this with something implementing
 ///   [`FastCGIBytes`] to assume/enforce an encoding.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct Record<C = Vec<u8>> {
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct Record<'a> {
     /// The version number of the record.
     pub version: Version,
-    /// The type of the record.
-    pub ty: RecordTy,
     /// The request/stream ID.
     pub request_id: u16,
     /// The amount of padding that was applied when sending this record.
@@ -567,9 +936,22 @@ pub struct Record<C = Vec<u8>> {
     /// The reserved-byte from the header.
     pub reserved: Option<u8>,
     /// The content, potentially something parsed already.
-    pub content: C,
+    pub content: RecordBody<'a>,
 }
-impl<C: ToFastCGIBytes> ToFastCGIBytes for Record<C> {
+impl<'a> Record<'a> {
+    /// Constructor for a [`Record`] such that it becomes a `FCGI_GET_VALUES` record.
+    #[inline]
+    pub fn new_get_values_record(params: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            version: Version::One,
+            request_id: 0,
+            padding_length: None,
+            reserved: None,
+            content: RecordBody::GetValues(RecordGetValues { params: params.into_iter().map(Cow::Borrowed).collect() }),
+        }
+    }
+}
+impl<'a> ToFastCGIBytes for Record<'a> {
     #[inline]
     fn to_fcgi_bytes<W: Write>(&self, mut output: W) -> Result<(), std::io::Error> {
         // typedef struct {
@@ -592,7 +974,7 @@ impl<C: ToFastCGIBytes> ToFastCGIBytes for Record<C> {
         //     unsigned char version;
         self.version.to_fcgi_bytes(&mut output)?;
         //     unsigned char type;
-        self.ty.to_fcgi_bytes(&mut output)?;
+        self.content.ty_to_fcgi_bytes(&mut output)?;
         //     unsigned char requestIdB1;
         //     unsigned char requestIdB0;
         self.request_id.to_fcgi_bytes(&mut output)?;
@@ -614,8 +996,8 @@ impl<C: ToFastCGIBytes> ToFastCGIBytes for Record<C> {
         Ok(())
     }
 }
-impl<C: FromFastCGIBytes> FromFastCGIBytes for Record<C> {
-    type Error = RecordError<C::Error>;
+impl FromFastCGIBytes for Record<'static> {
+    type Error = RecordError;
 
     #[inline]
     fn from_fcgi_bytes<R: Read>(mut input: R) -> Result<Option<Self>, Self::Error> {
@@ -639,17 +1021,17 @@ impl<C: FromFastCGIBytes> FromFastCGIBytes for Record<C> {
         #[cfg(feature = "log")]
         log::trace!("Parsed version: {version:?}");
         //     unsigned char type;
-        let ty = escape_none!(RecordTy::from_fcgi_bytes(&mut input).map_err(RecordError::Read)?);
+        let ty = escape_none!(u8::from_fcgi_bytes(&mut input).map_err(RecordError::Read)?);
         #[cfg(feature = "log")]
         log::trace!("Parsed type: {ty:?}");
         //     unsigned char requestIdB1;
         //     unsigned char requestIdB0;
-        let request_id = escape_none!(u16::from_fcgi_bytes(&mut input).map_err(RecordError::Read)?);
+        let request_id = escape_none!(u16::from_fcgi_bytes(&mut input).map_err(RecordError::u16)?);
         #[cfg(feature = "log")]
         log::trace!("Parsed request ID: {request_id:?}");
         //     unsigned char contentLengthB1;
         //     unsigned char contentLengthB0;
-        let content_len = escape_none!(u16::from_fcgi_bytes(&mut input).map_err(RecordError::Read)?);
+        let content_len = escape_none!(u16::from_fcgi_bytes(&mut input).map_err(RecordError::u16)?);
         #[cfg(feature = "log")]
         log::trace!("Parsed content length: {content_len} bytes");
         //     unsigned char paddingLength;
@@ -661,16 +1043,8 @@ impl<C: FromFastCGIBytes> FromFastCGIBytes for Record<C> {
         #[cfg(feature = "log")]
         log::trace!("Reserved byte: {reserved:?}");
         //     unsigned char contentData[contentLength];
-        let mut content_i: usize = 0;
-        let mut content: Vec<u8> = vec![0; content_len as usize];
-        while content_i < content_len as usize {
-            let len: usize = input.read(&mut content[content_i..]).map_err(RecordError::Read)?;
-            if len == 0 {
-                return Ok(None);
-            }
-            content_i += len;
-        }
-        let content = escape_none!(C::from_fcgi_bytes(content.as_slice()).map_err(RecordError::Content)?);
+        let content =
+            escape_none!(RecordBody::from_fcgi_bytes_and_ty(ty, FixedLenReader::new(content_len as usize, &mut input)).map_err(RecordError::Body)?);
         //     unsigned char paddingData[paddingLength];
         // NOTE: We just pop this
         for _ in 0..padding_length {
@@ -679,52 +1053,9 @@ impl<C: FromFastCGIBytes> FromFastCGIBytes for Record<C> {
             }
         }
 
-        Ok(Some(Self { version, ty, request_id, padding_length: Some(padding_length), reserved: Some(reserved), content }))
+        Ok(Some(Self { version, request_id, padding_length: Some(padding_length), reserved: Some(reserved), content }))
     }
 }
-
-
-
-
-
-/***** MANAGEMENT RECORD TYPES *****/
-/// Represents a [`RecordError`] instantiated to parse [`GetvaluesRecord`]s.
-pub type GetValuesRecordError = RecordError<PairError<StringError, Infallible>>;
-
-/// Represents a [`Record`] instantiated to request a sequence of parameter values from the
-/// application.
-pub type GetValuesRecord<'p> = Record<Vec<Pair<&'p str, ()>>>;
-
-impl<'p> GetValuesRecord<'p> {
-    /// Constructor for a [`GetValuesRecord`].
-    ///
-    /// # Arguments
-    /// - `params`: An exhaustive list of parameters to request the value of in the application. To
-    ///   request the factory parameters, give [`PARAM_MAX_CONNS`], [`PARAM_MAX_REQS`] and
-    ///   [`PARAM_MPXS_CONNS`].
-    ///
-    /// # Returns
-    /// A new Record that represents a GetValuesRecord for the given `params`.
-    #[inline]
-    pub fn new_get_values_record(params: impl IntoIterator<Item = &'p str>) -> Self {
-        Self {
-            version: Version::One,
-            ty: RecordTy::GetValues,
-            request_id: 0,
-            padding_length: None,
-            reserved: None,
-            content: params.into_iter().map(|p| Pair { name: p, value: () }).collect(),
-        }
-    }
-}
-
-
-
-/// Represents a [`RecordError`] instantiated to parse [`GetvaluesRecord`]s.
-pub type GetValuesResultRecordError = RecordError<PairError<StringError, StringError>>;
-
-/// Represents a [`Record`] instantiated as response to a [`GetValuesRecord`].
-pub type GetValuesResultRecord = Record<Vec<Pair<String, String>>>;
 
 
 
@@ -757,7 +1088,7 @@ mod tests {
         assert_to_fcgi_bytes::<&'static str>();
         assert_to_fcgi_bytes::<Pair<&'static str, ()>>();
         assert_to_fcgi_bytes::<Vec<Pair<&'static str, ()>>>();
-        assert_to_fcgi_bytes::<GetValuesRecord<'static>>();
+        assert_to_fcgi_bytes::<Record<'static>>();
     }
 
     #[test]
@@ -788,7 +1119,25 @@ mod tests {
                 ),
                 value: String::from("bar"),
             }),
-            b"\0\0\x02\xE7\x03Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not. It's not a story the Jedi would tell you. It's a Sith legend. Darth Plagueis was a Dark Lord of the Sith, so powerful and so wise he could use the Force to influence the midichlorians to create life... He had such a knowledge of the dark side that he could even keep the ones he cared about from dying. The dark side of the Force is a pathway to many abilities some consider to be unnatural. He became so powerful... the only thing he was afraid of was losing his power, which eventually, of course, he did. Unfortunately, he taught his apprentice everything he knew, then his apprentice killed him in his sleep. Ironic. He could save others from death, but not himself.bar"
+            b"\x80\0\x02\xE7\x03Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not. It's not a story the Jedi would tell you. It's a Sith legend. Darth Plagueis was a Dark Lord of the Sith, so powerful and so wise he could use the Force to influence the midichlorians to create life... He had such a knowledge of the dark side that he could even keep the ones he cared about from dying. The dark side of the Force is a pathway to many abilities some consider to be unnatural. He became so powerful... the only thing he was afraid of was losing his power, which eventually, of course, he did. Unfortunately, he taught his apprentice everything he knew, then his apprentice killed him in his sleep. Ironic. He could save others from death, but not himself.bar"
+        );
+    }
+    #[test]
+    fn test_pair_from_fcgi_bytes() {
+        assert_eq!(devectorize(b"\0\0"), Some(Pair { name: String::new(), value: () }));
+        assert_eq!(devectorize(b"\x03\x03foobar"), Some(Pair { name: String::from("foo"), value: String::from("bar") }));
+        assert_eq!(
+            devectorize(b"\x80\0\x02\xE7\x03Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not. It's not a story the Jedi would tell you. It's a Sith legend. Darth Plagueis was a Dark Lord of the Sith, so powerful and so wise he could use the Force to influence the midichlorians to create life... He had such a knowledge of the dark side that he could even keep the ones he cared about from dying. The dark side of the Force is a pathway to many abilities some consider to be unnatural. He became so powerful... the only thing he was afraid of was losing his power, which eventually, of course, he did. Unfortunately, he taught his apprentice everything he knew, then his apprentice killed him in his sleep. Ironic. He could save others from death, but not himself.bar"), Some(Pair {
+                name:  String::from(
+                    "Did you ever hear the tragedy of Darth Plagueis The Wise? I thought not. It's not a story the Jedi would tell you. It's a Sith \
+                     legend. Darth Plagueis was a Dark Lord of the Sith, so powerful and so wise he could use the Force to influence the \
+                     midichlorians to create life... He had such a knowledge of the dark side that he could even keep the ones he cared about from \
+                     dying. The dark side of the Force is a pathway to many abilities some consider to be unnatural. He became so powerful... the \
+                     only thing he was afraid of was losing his power, which eventually, of course, he did. Unfortunately, he taught his apprentice \
+                     everything he knew, then his apprentice killed him in his sleep. Ironic. He could save others from death, but not himself."
+                ),
+                value: String::from("bar"),
+            })
         );
     }
 
@@ -797,14 +1146,12 @@ mod tests {
         assert_eq!(
             vectorize(Record {
                 version: Version::One,
-                ty: RecordTy::GetValues,
                 request_id: 0,
                 padding_length: None,
                 reserved: None,
-                content: vec![Pair { name: "FCGI_MAX_CONNS".to_string(), value: () }, Pair { name: "FCGI_MAX_REQS".to_string(), value: () }, Pair {
-                    name:  "FCGI_MPXS_CONNS".to_string(),
-                    value: (),
-                }],
+                content: RecordBody::GetValues(RecordGetValues {
+                    params: vec![Cow::Borrowed("FCGI_MAX_CONNS"), Cow::Borrowed("FCGI_MAX_REQS"), Cow::Borrowed("FCGI_MPXS_CONNS")],
+                }),
             }),
             b"\x01\x09\0\0\0\x30\0\0\x0e\0FCGI_MAX_CONNS\x0d\0FCGI_MAX_REQS\x0f\0FCGI_MPXS_CONNS"
         );
@@ -815,14 +1162,12 @@ mod tests {
             devectorize(b"\x01\x09\0\0\0\x30\x02\0\x0e\0FCGI_MAX_CONNS\x0d\0FCGI_MAX_REQS\x0f\0FCGI_MPXS_CONNS\0\0"),
             Some(Record {
                 version: Version::One,
-                ty: RecordTy::GetValues,
                 request_id: 0,
                 padding_length: Some(2),
                 reserved: Some(0),
-                content: vec![Pair { name: "FCGI_MAX_CONNS".to_string(), value: () }, Pair { name: "FCGI_MAX_REQS".to_string(), value: () }, Pair {
-                    name:  "FCGI_MPXS_CONNS".to_string(),
-                    value: (),
-                }],
+                content: RecordBody::GetValues(RecordGetValues {
+                    params: vec![Cow::Owned("FCGI_MAX_CONNS".into()), Cow::Owned("FCGI_MAX_REQS".into()), Cow::Owned("FCGI_MPXS_CONNS".into())],
+                }),
             },)
         );
     }
