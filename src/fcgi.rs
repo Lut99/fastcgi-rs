@@ -89,49 +89,46 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FastCGI<S> {
     pub async fn get_values<'p>(&self, params: impl IntoIterator<Item = &'p str>) -> Result<HashMap<String, String>, Error> {
         let mut conn = self.0.lock();
 
-        // Pre-compute the record length
-        let params: Vec<&'p str> = params.into_iter().collect();
-        let content_len: usize = params.iter().map(|p| if p.len() <= 127 { 2 + p.len() } else { 5 + p.len() }).sum();
-        if content_len > u16::MAX as usize {
-            return Err(Error::ContentLenOverflow { got: content_len });
-        }
-        let content_len: u16 = content_len as u16;
+        // Serialize the content to a buffer first
         #[cfg(feature = "log")]
-        log::trace!("Predicted content length: {content_len} bytes");
-
-        // Construct the header and write it
-        let header = RecordHeader { version: Version::One, ty: RecordTy::GetValues, request_id: 0, content_len, padding_len: 0, reserved: 0 }
-            .with_auto_padding();
-        let mut header: [u8; 8] = header.into();
-        #[cfg(feature = "log")]
-        log::trace!("Serialized request header: {header:?}");
-        conn.write_all(&header).await.map_err(Error::Write)?;
-
-        // Write the parameter pairs
+        log::trace!("Serializing content to memory buffer...");
+        let mut content: Vec<u8> = Vec::new();
         for (i, p) in params.into_iter().enumerate() {
             // Write the lengths first (length of the name + empty for value)
             if p.len() > u32::MAX as usize {
                 return Err(Error::ParamLenOverflow { i, got: p.len() });
             }
-            write_u32_compact(p.len() as u32, &mut *conn).await.map_err(Error::Write)?;
-            conn.write_all(&[0x00]).await.map_err(Error::Write)?;
+            write_u32_compact(p.len() as u32, &mut content).await.map_err(Error::Write)?;
+            content.write_all(&[0x00]).await.map_err(Error::Write)?;
 
             // Then write the raw name bytes
-            conn.write_all(p.as_bytes()).await.map_err(Error::Write)?;
+            content.write_all(p.as_bytes()).await.map_err(Error::Write)?;
         }
+        let content_len: u16 = content.len().try_into().map_err(|_| Error::ContentLenOverflow { got: content.len() })?;
+        #[cfg(feature = "log")]
+        log::trace!("Content length: {content_len} byte(s)");
+
+        // Construct the header and write it
+        let header = RecordHeader { version: Version::One, ty: RecordTy::GetValues, request_id: 0, content_len, padding_len: 0, reserved: 0 }
+            .with_auto_padding();
+        let mut bheader: [u8; 8] = header.into();
+        #[cfg(feature = "log")]
+        log::trace!("Serialized request header {header:?} => {bheader:?}");
+        conn.write_all(&bheader).await.map_err(Error::Write)?;
+
+        // Write the content now
+        conn.write_all(&content).await.map_err(Error::Write)?;
         conn.flush().await.map_err(Error::Write)?;
         #[cfg(feature = "log")]
-        log::trace!("Wrote entire record");
+        log::trace!("Wrote content, finishing the record");
 
         // OK, now await a record header back
         #[cfg(feature = "log")]
         log::trace!("Awaiting reply...");
-        conn.read_exact(&mut header).await.map_err(Error::Read)?;
+        conn.read_exact(&mut bheader).await.map_err(Error::Read)?;
+        let header: RecordHeader = bheader.try_into().map_err(Error::RecordHeader)?;
         #[cfg(feature = "log")]
-        log::trace!("Reply header: {header:?}");
-        let header: RecordHeader = header.try_into().map_err(Error::RecordHeader)?;
-        #[cfg(feature = "log")]
-        log::trace!("Deserialized reply header: {header:?}");
+        log::trace!("Deserialized reply header {bheader:?} => {header:?}");
         if header.ty != RecordTy::GetValuesResult {
             return Err(Error::UnexpectedRecord { got: header.ty, expected: RecordTy::GetValuesResult });
         }
@@ -170,19 +167,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FastCGI<S> {
 
             // Push 'em
             #[cfg(feature = "log")]
-            log::trace!("Parsed name/value pair {name:?}/{value:?} ({name_len} bytes/{value_len} bytes)");
+            log::trace!("Parsed name/value pair {name:?}/{value:?} ({name_len} byte(s)/{value_len} byte(s))");
             res.insert(name, value);
             read += if name_len <= 127 { 1 } else { 4 } + if value_len <= 127 { 1 } else { 4 } + name_len as usize + value_len as usize;
         }
         #[cfg(feature = "log")]
-        log::trace!("Read {read} content bytes");
+        log::trace!("Read {read} content byte(s)");
 
         // Pop the padding before we're done
         for _ in 0..header.padding_len {
             conn.read_u8().await.map_err(Error::Read)?;
         }
         #[cfg(feature = "log")]
-        log::trace!("Popped {} bytes padding", header.padding_len);
+        log::trace!("Popped {} byte(s) padding", header.padding_len);
 
         // Done!
         Ok(res)
